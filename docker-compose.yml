@@ -1,0 +1,22 @@
+services:
+  kyber:
+    image: your/kyber:latest
+    ports: ["8080:8080"]
+
+  dilithium:
+    image: your/dilithium:latest
+    ports: ["8081:8081"]
+
+  falcon:
+    image: your/falcon:latest
+    ports: ["8083:8083"]
+
+  auto_selector:
+    build: ./auto-selector
+    environment:
+      KYBER_BASE: "http://kyber:8080"
+      DILITHIUM_BASE: "http://dilithium:8081"
+      FALCON_BASE: "http://falcon:8083"
+      PORT: "8090"
+    ports: ["8090:8090"]
+    depends_on: [kyber, dilithium, falcon]

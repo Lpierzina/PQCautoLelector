@@ -1,0 +1,7 @@
+{
+  "name": "pqc-auto-selector",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "fastify": "^4.26.2" }
+}

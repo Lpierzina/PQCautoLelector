@@ -1,0 +1,170 @@
+// /auto-selector/server.js
+import Fastify from 'fastify';
+
+const fastify = Fastify({ logger: true });
+
+// ---- Config (env overrides supported) ----
+const PORT = Number(process.env.PORT) || 8090;
+const HOST = process.env.HOST || '0.0.0.0';
+
+const KYBER_BASES = [
+  process.env.KYBER_BASE,
+  'http://localhost:8080', 'http://127.0.0.1:8080', 'http://host.docker.internal:8080'
+].filter(Boolean);
+
+const DILITHIUM_BASES = [
+  process.env.DILITHIUM_BASE,
+  'http://localhost:8081', 'http://127.0.0.1:8081', 'http://host.docker.internal:8081'
+].filter(Boolean);
+
+const FALCON_BASES = [
+  process.env.FALCON_BASE,
+  'http://localhost:8083', 'http://127.0.0.1:8083', 'http://host.docker.internal:8083'
+].filter(Boolean);
+
+// ---- helpers ----
+function withTimeout(promise, ms = 2500) {
+  return Promise.race([
+    promise,
+    new Promise((_, r) => setTimeout(() => r(new Error('timeout')), ms))
+  ]);
+}
+async function probe(base) {
+  try {
+    const res = await withTimeout(fetch(`${base}/health`), 1500);
+    return !!res?.ok || res?.status >= 200; // any HTTP response means reachable
+  } catch (_) { return false; }
+}
+async function firstReachable(bases) {
+  for (const b of bases) if (await probe(b)) return b;
+  return null;
+}
+async function postJSON(url, body, timeoutMs = 4000) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+      signal: ctrl.signal
+    });
+    const txt = await res.text();
+    let json; try { json = txt ? JSON.parse(txt) : {}; } catch { json = { raw: txt }; }
+    if (!res.ok) throw new Error(json?.error || `${url} -> ${res.status}`);
+    return json;
+  } finally { clearTimeout(id); }
+}
+
+// ---- policy engine ----
+// Inputs: payloadHintBytes (number), policyPreferredSig ('dilithium'|'falcon'|null)
+// Health-based fallback included.
+async function selectSigScheme({ payloadHintBytes, policyPreferredSig }) {
+  // 1) Health
+  const [dReach, fReach] = await Promise.all([
+    firstReachable(DILITHIUM_BASES).then(Boolean),
+    firstReachable(FALCON_BASES).then(Boolean),
+  ]);
+
+  // 2) Policy preferred (if healthy)
+  if (policyPreferredSig === 'falcon' && fReach) return 'falcon';
+  if (policyPreferredSig === 'dilithium' && dReach) return 'dilithium';
+
+  // 3) Payload-size heuristic (Falcon signatures are smaller)
+  if (!isNaN(payloadHintBytes) && payloadHintBytes > 0) {
+    if (payloadHintBytes <= 1024 && fReach) return 'falcon'; // tight channels → Falcon
+  }
+
+  // 4) Default → Dilithium if healthy, else Falcon if healthy
+  if (dReach) return 'dilithium';
+  if (fReach) return 'falcon';
+
+  // 5) Neither reachable
+  throw new Error('No signature service reachable');
+}
+
+// ---- endpoints ----
+fastify.get('/health', async () => {
+  const kb = await firstReachable(KYBER_BASES);
+  const db = await firstReachable(DILITHIUM_BASES);
+  const fb = await firstReachable(FALCON_BASES);
+  return {
+    status: kb && (db || fb) ? 'ok' : 'degraded',
+    kyber: { reachable: !!kb, base: kb },
+    dilithium: { reachable: !!db, base: db },
+    falcon: { reachable: !!fb, base: fb }
+  };
+});
+
+// One-call AKE: pick scheme → sign Kyber pubkey → encap/decap → return shared secret
+fastify.post('/select/ake', async (req, reply) => {
+  try {
+    const { payloadHintBytes, policyPreferredSig, level } = req.body ?? {};
+    // choose sig scheme
+    const scheme = await selectSigScheme({ payloadHintBytes, policyPreferredSig });
+
+    // discover bases
+    const kyberBase = await firstReachable(KYBER_BASES);
+    if (!kyberBase) throw new Error('Kyber unreachable');
+    const sigBase = scheme === 'dilithium'
+      ? await firstReachable(DILITHIUM_BASES)
+      : await firstReachable(FALCON_BASES);
+    if (!sigBase) throw new Error(`${scheme} unreachable`);
+
+    // 1) Generate Kyber keys
+    const { publicKey: kyberPublicKey, secretKey: kyberSecretKey } =
+      await postJSON(`${kyberBase}/kyber/generate-keypair`, {});
+
+    // 2) Get orchestrator signer (from chosen scheme service)
+    const signerInfo = await fetch(`${sigBase}/orchestrator/signer`).then(r => r.json());
+    const signerPublicKey = signerInfo.publicKey;
+    const signerLevel = level || signerInfo.level;
+
+    // 3) Ask chosen scheme to sign Kyber pubkey
+    const signEndpoint = scheme === 'dilithium' ? '/dilithium/sign' : '/falcon/sign';
+    const signRes = await postJSON(`${sigBase}${signEndpoint}`, {
+      message: kyberPublicKey,
+      privateKey: undefined, // their orchestrator has its own internal signer
+      // NOTE: in your Dilithium/Falcon services, /dilithium/sign or /falcon/sign typically require a privateKey,
+      // BUT you already exposed /orchestrator/bootstrap that returns a signature using the internal signer.
+      // If so, swap step 3 to call `${sigBase}/orchestrator/bootstrap` instead and use returned signature.
+    }).catch(async () => {
+      // Fallback to bootstrap flow if sign requires privateKey in your service
+      const b = await postJSON(`${sigBase}/orchestrator/bootstrap`, {});
+      return { signature: b.signature, isCompressed: b.isCompressed };
+    });
+    const { signature } = signRes;
+
+    // 4) Verify signature & encapsulate with verified Kyber key
+    const encapRes = await postJSON(`${sigBase}/orchestrator/encapsulate-verified`, {
+      kyberPublicKey,
+      signature,
+      signerPublicKey,
+      level: signerLevel
+    });
+
+    // 5) Decapsulate on Kyber to confirm shared secret
+    const decapRes = await postJSON(`${sigBase}/orchestrator/decapsulate`, {
+      secretKey: kyberSecretKey,
+      ciphertext: encapRes.ciphertext
+    });
+
+    const same = encapRes.sharedSecret === decapRes.sharedSecret;
+
+    return {
+      status: same ? 'ok' : 'mismatch',
+      schemeSelected: scheme,
+      reason: policyPreferredSig ? `policy:${policyPreferredSig}` :
+              (payloadHintBytes && payloadHintBytes <= 1024) ? 'payload_tight' :
+              'default_or_health',
+      signerLevel,
+      kyber: { ciphertextLen: encapRes.ciphertext?.length ?? 0 },
+      sharedSecretMatch: same
+    };
+  } catch (e) {
+    reply.code(502);
+    return { error: 'select_ake_failed', detail: e?.message || String(e) };
+  }
+});
+
+await fastify.listen({ port: PORT, host: HOST });
