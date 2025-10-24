@@ -144,7 +144,7 @@ fastify.post('/select/ake', async (req, reply) => {
     });
 
     // 5) Decapsulate on Kyber to confirm shared secret
-    const decapRes = await postJSON(`${sigBase}/orchestrator/decapsulate`, {
+    const decapRes = await postJSON(`${kyberBase}/kyber/decapsulate`, {
       secretKey: kyberSecretKey,
       ciphertext: encapRes.ciphertext
     });
