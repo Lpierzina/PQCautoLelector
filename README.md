@@ -37,6 +37,44 @@ docker run -p 8090:8090 pqc-orchestrator
 
 Note: Kyber/Dilithium/Falcon live in other repos and must be reachable via network. By default the orchestrator will try `localhost` and `host.docker.internal` for each port. You can override with env vars.
 
+### Integration tests
+
+The repo includes lightweight integration tests (no framework) that verify:
+
+- AKE switching behavior based on policy and payload size
+- Falcon service using Kyber for authenticated KEM
+
+Preconditions:
+- Kyber at `8080`, optionally Dilithium at `8081`, Falcon at `8083`
+- If a service is down, related assertions are skipped
+
+Run tests:
+```bash
+npm test
+```
+
+What tests do:
+- Call `/health` and `/select/ake` to ensure shared secrets match and scheme selection works
+- Call downstream services to prove Falcon verifies and encapsulates against a Kyber public key it signed
+
+If you see network errors (tests cannot reach services), start your PQC microservices first, for example:
+```bash
+# in your Kyber repo
+npm start  # should listen on :8080
+
+# in your Falcon repo
+npm start  # should listen on :8083
+
+# (optional) in your Dilithium repo
+npm start  # should listen on :8081
+
+# then run the orchestrator in this repo
+npm start
+
+# and re-run tests
+npm test
+```
+
 ## Configuration
 Environment variables (optional overrides):
 - `PORT` (default: 8090)
@@ -133,6 +171,15 @@ curl -s -X POST localhost:8090/select/ake \
   -H 'content-type: application/json' \
   -d '{"payloadHintBytes":512}' | jq
 ```
+
+### Troubleshooting
+- Error `select_ake_failed: Invalid signature over Kyber public key`:
+  - Ensure the signature service signs the exact Kyber public key that is later verified.
+  - This orchestrator now falls back to `/orchestrator/bootstrap` and uses the returned Kyber keys and signer when provided, ensuring alignment.
+  - If using custom endpoints, prefer `messageBase64` for signing/verification payloads.
+- Services unreachable:
+  - Check host/ports or set `KYBER_BASE`, `DILITHIUM_BASE`, `FALCON_BASE`.
+  - If running inside Docker, `host.docker.internal` may be needed.
 
 ## Deployment tips
 - Run orchestrator close to PQC services to minimize latency.

@@ -115,37 +115,58 @@ fastify.post('/select/ake', async (req, reply) => {
     const { publicKey: kyberPublicKey, secretKey: kyberSecretKey } =
       await postJSON(`${kyberBase}/kyber/generate-keypair`, {});
 
+    // Track the active keys that pair with the signature we will use
+    let activeKyberPublicKey = kyberPublicKey;
+    let activeKyberSecretKey = kyberSecretKey;
+
     // 2) Get orchestrator signer (from chosen scheme service)
     const signerInfo = await fetch(`${sigBase}/orchestrator/signer`).then(r => r.json());
-    const signerPublicKey = signerInfo.publicKey;
+    let signerPublicKey = signerInfo.publicKey;
     const signerLevel = level || signerInfo.level;
 
     // 3) Ask chosen scheme to sign Kyber pubkey
     const signEndpoint = scheme === 'dilithium' ? '/dilithium/sign' : '/falcon/sign';
-    const signRes = await postJSON(`${sigBase}${signEndpoint}`, {
-      message: kyberPublicKey,
-      privateKey: undefined, // their orchestrator has its own internal signer
-      // NOTE: in your Dilithium/Falcon services, /dilithium/sign or /falcon/sign typically require a privateKey,
-      // BUT you already exposed /orchestrator/bootstrap that returns a signature using the internal signer.
-      // If so, swap step 3 to call `${sigBase}/orchestrator/bootstrap` instead and use returned signature.
-    }).catch(async () => {
-      // Fallback to bootstrap flow if sign requires privateKey in your service
+    let signature;
+    let isCompressed;
+    try {
+      // Prefer messageBase64, many services expect base64 input for signing
+      const sr = await postJSON(`${sigBase}${signEndpoint}`, {
+        messageBase64: activeKyberPublicKey,
+        level: signerLevel
+      });
+      signature = sr.signature ?? sr.signatureBase64 ?? sr.sig;
+      isCompressed = sr.isCompressed;
+    } catch (_) {
+      // Fallback to bootstrap: some services expose a bootstrap that already
+      // generates a Kyber keypair and signs its public key using the internal signer.
       const b = await postJSON(`${sigBase}/orchestrator/bootstrap`, {});
-      return { signature: b.signature, isCompressed: b.isCompressed };
-    });
-    const { signature } = signRes;
+      signature = b.signature ?? b.signatureBase64 ?? b.sig;
+      isCompressed = b.isCompressed;
+
+      // If bootstrap returns Kyber keys, use them to keep signature and key aligned
+      if (b.kyberPublicKey && b.kyberSecretKey) {
+        activeKyberPublicKey = b.kyberPublicKey;
+        activeKyberSecretKey = b.kyberSecretKey;
+      }
+      // If bootstrap returns signer public key, prefer it
+      const maybeSigner = b.signerPublicKey || b.falconSignerPublicKey || b.dilithiumSignerPublicKey || b.publicKey;
+      if (maybeSigner) signerPublicKey = maybeSigner;
+    }
+
+    if (!signature) throw new Error('No signature produced');
 
     // 4) Verify signature & encapsulate with verified Kyber key
     const encapRes = await postJSON(`${sigBase}/orchestrator/encapsulate-verified`, {
-      kyberPublicKey,
+      kyberPublicKey: activeKyberPublicKey,
       signature,
       signerPublicKey,
-      level: signerLevel
+      level: signerLevel,
+      isCompressed
     });
 
     // 5) Decapsulate on Kyber to confirm shared secret
     const decapRes = await postJSON(`${kyberBase}/kyber/decapsulate`, {
-      secretKey: kyberSecretKey,
+      secretKey: activeKyberSecretKey,
       ciphertext: encapRes.ciphertext
     });
 
