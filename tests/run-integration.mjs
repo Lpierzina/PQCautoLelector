@@ -46,6 +46,22 @@ async function main() {
     {
       name: 'Falcon uses Kyber (service-level proof)',
       mod: await import('./integration/falcon_kyber_proof.mjs')
+    },
+    {
+      name: 'Default selection behavior (health + large payload)',
+      mod: await import('./integration/default_selection.mjs')
+    },
+    {
+      name: 'Policy overrides payload heuristic',
+      mod: await import('./integration/policy_overrides.mjs')
+    },
+    {
+      name: 'Health endpoint semantics',
+      mod: await import('./integration/health_semantics.mjs')
+    },
+    {
+      name: 'Failure modes and error semantics',
+      mod: await import('./integration/failure_modes.mjs')
     }
   ];
 
