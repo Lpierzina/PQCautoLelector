@@ -140,8 +140,16 @@ fastify.post('/select/ake', async (req, reply) => {
 
     // 2) Get orchestrator signer (from chosen scheme service)
     const signerInfo = await fetch(`${sigBase}/orchestrator/signer`).then(r => r.json());
-    let signerPublicKey = signerInfo.publicKey;
-    const signerLevel = level || signerInfo.level;
+    // Prefer algorithm-specific fields when available; fall back to generic
+    let signerPublicKey = signerInfo.signerPublicKey
+      || signerInfo.falconSignerPublicKey
+      || signerInfo.dilithiumSignerPublicKey
+      || signerInfo.publicKey;
+    let signerLevel = level || signerInfo.level || signerInfo.alg || signerInfo.algorithm;
+    // Normalize algorithm string if embeded in level
+    const algFromLevel = typeof signerLevel === 'string' && /^(falcon|dilithium)-l[1-5]$/i.test(signerLevel)
+      ? signerLevel.toLowerCase()
+      : null;
 
     // 3) Prefer using the Key Rotation service to sign (if available)
     //    Fallback to underlying signature service if rotation is unavailable.
@@ -152,7 +160,9 @@ fastify.post('/select/ake', async (req, reply) => {
 
     if (rotationBase) {
       try {
-        const rotAlg = scheme === 'dilithium' ? 'dilithium-l3' : 'falcon-l1';
+        // Choose rotation algorithm to MATCH the underlying signature service
+        // Prefer explicit algorithm-style level if provided by signer
+        const rotAlg = algFromLevel || (scheme === 'dilithium' ? 'dilithium-l3' : 'falcon-l5');
         // Ensure a current key exists; rotate if necessary
         let current = null;
         try {
@@ -169,6 +179,12 @@ fastify.post('/select/ake', async (req, reply) => {
         });
         signature = sr.signatureB64 || sr.signatureBase64 || sr.signature || sr.sig;
         if (current?.publicKey) signerPublicKey = current.publicKey;
+        // Prefer level/alg reported by rotator for correctness; fallback to rotAlg
+        signerLevel = (current && (current.level || current.alg)) || rotAlg;
+        // Capture compression hint if rotator returns one (mainly Falcon)
+        if (typeof sr.isCompressed === 'boolean') {
+          isCompressed = sr.isCompressed;
+        }
       } catch (_) {
         // Rotation signing failed; fall through to direct signer
       }
@@ -198,6 +214,7 @@ fastify.post('/select/ake', async (req, reply) => {
         // If bootstrap returns signer public key, prefer it
         const maybeSigner = b.signerPublicKey || b.falconSignerPublicKey || b.dilithiumSignerPublicKey || b.publicKey;
         if (maybeSigner) signerPublicKey = maybeSigner;
+        if (b.level) signerLevel = b.level;
       }
     }
 
