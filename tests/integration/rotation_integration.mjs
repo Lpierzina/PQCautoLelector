@@ -34,10 +34,20 @@ export default async function test() {
     return { skipped: true, reason: 'rotation unreachable' };
   }
 
-  // Exercise both algs if possible; pick small payload to prefer Falcon
-  const req = await postJSON(`${ORCH}/select/ake`, { payloadHintBytes: 512 });
-  if (!req.ok) throw new Error(`/select/ake failed: ${req.json?.detail || req.status}`);
-  if (!req.json.sharedSecretMatch) throw new Error('shared secrets mismatch');
-  log(`Rotator-backed AKE OK via scheme=${req.json.schemeSelected}`, 'green');
+  // Ensure both algorithms have an active key
+  await postJSON(`${ROT}/keys/rotate`, { alg: 'falcon-l5' });
+  await postJSON(`${ROT}/keys/rotate`, { alg: 'dilithium-l3' });
+
+  // 1) Falcon path (small payload)
+  const fal = await postJSON(`${ORCH}/select/ake`, { payloadHintBytes: 512 });
+  if (!fal.ok) throw new Error(`/select/ake failed: ${fal.json?.detail || fal.status}`);
+  if (!fal.json.sharedSecretMatch) throw new Error('shared secrets mismatch (falcon)');
+  log(`Rotator-backed AKE OK via scheme=${fal.json.schemeSelected}`, 'green');
+
+  // 2) Dilithium path (explicit policy)
+  const dil = await postJSON(`${ORCH}/select/ake`, { payloadHintBytes: 4096, policyPreferredSig: 'dilithium' });
+  if (!dil.ok) throw new Error(`/select/ake failed: ${dil.json?.detail || dil.status}`);
+  if (!dil.json.sharedSecretMatch) throw new Error('shared secrets mismatch (dilithium)');
+  log(`Rotator-backed AKE OK via scheme=${dil.json.schemeSelected}`, 'green');
   return true;
 }
