@@ -44,6 +44,10 @@ async function main() {
       mod: await import('./integration/ake_switch.mjs')
     },
     {
+      name: 'Rotation-backed AKE (if rotator reachable)',
+      mod: await import('./integration/rotation_integration.mjs')
+    },
+    {
       name: 'Falcon uses Kyber (service-level proof)',
       mod: await import('./integration/falcon_kyber_proof.mjs')
     },

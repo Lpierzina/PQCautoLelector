@@ -7,4 +7,5 @@ services:
       # KYBER_BASE: "http://kyber.example.net:8080"
       # DILITHIUM_BASE: "http://dilithium.example.net:8081"
       # FALCON_BASE: "http://falcon.example.net:8083"
+      # KEYROTATION_BASE: "http://rotator.example.net:8092"  # optional standalone key rotation service
     ports: ["8090:8090"]
