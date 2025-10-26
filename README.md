@@ -5,6 +5,7 @@ A lightweight Fastify microservice that sits in front of your Kyber KEM and sign
 - Kyber KEM: expected at 8080 (separate service/repo)
 - Dilithium: expected at 8081 (separate service/repo)
 - Falcon: expected at 8083 (separate service/repo)
+- Optional Key Rotation: expected at 8092 (separate service/repo)
 - Orchestrator/Auto-Selector (this repo): 8090
 
 The orchestrator does NOT run PQC algorithms itself. It orchestrates the external PQC microservices.
@@ -35,7 +36,7 @@ docker build -t pqc-orchestrator .
 docker run -p 8090:8090 pqc-orchestrator
 ```
 
-Note: Kyber/Dilithium/Falcon live in other repos and must be reachable via network. By default the orchestrator will try `localhost` and `host.docker.internal` for each port. You can override with env vars.
+Note: Kyber/Dilithium/Falcon (and optional Key Rotation) live in other repos and must be reachable via network. By default the orchestrator will try `localhost` and `host.docker.internal` for each port. You can override with env vars.
 
 ### Integration tests
 
@@ -46,6 +47,7 @@ The repo includes lightweight integration tests (no framework) that verify:
 
 Preconditions:
 - Kyber at `8080`, optionally Dilithium at `8081`, Falcon at `8083`
+- Optional: Key Rotation at `8092` (rotation-specific test is skipped if down)
 - If a service is down, related assertions are skipped
 
 Run tests:
@@ -82,6 +84,7 @@ Environment variables (optional overrides):
 - `KYBER_BASE` (e.g., `http://kyber.example:8080`)
 - `DILITHIUM_BASE` (e.g., `http://dilithium.example:8081`)
 - `FALCON_BASE` (e.g., `http://falcon.example:8083`)
+- `KEYROTATION_BASE` (or `ROTATION_BASE`) (e.g., `http://rotator.example:8092`)
 
 The service also tries fallbacks: `http://localhost:<port>`, `http://127.0.0.1:<port>`, `http://host.docker.internal:<port>`.
 
@@ -96,7 +99,8 @@ Response example:
   "status": "ok", // or "degraded"
   "kyber": { "reachable": true, "base": "http://localhost:8080" },
   "dilithium": { "reachable": true, "base": "http://localhost:8081" },
-  "falcon": { "reachable": false, "base": null }
+  "falcon": { "reachable": false, "base": null },
+  "rotation": { "reachable": true, "base": "http://localhost:8092" }
 }
 ```
 
@@ -144,6 +148,16 @@ Dilithium/Falcon service:
 - `POST /orchestrator/encapsulate-verified` → `{ ciphertext, sharedSecret }` (input includes `kyberPublicKey`, `signature`, `signerPublicKey`, `level`)
 
 The orchestrator will try `/dilithium/sign` or `/falcon/sign` first; if the signature service requires hidden keys and doesn’t accept a missing `privateKey`, it will fall back to `/orchestrator/bootstrap`.
+
+### Optional: Key Rotation service (8092)
+- `GET /health` → `{ status: "ok" }`
+- `POST /keys/rotate` `{ alg }` → provisions/activates a key for `alg`
+- `GET /orchestrator/keys/current?alg=ALG` → returns current public key
+- `POST /sign` `{ alg, messageB64 }` → `{ kid, signatureB64 }`
+
+When reachable, the orchestrator will use this service to obtain current signer keys and produce signatures over Kyber public keys before calling the signature service for encapsulation/verification. Algorithms:
+- `dilithium-l3`
+- `falcon-l1`
 
 ## Scheme selection policy
 Order of decisions:

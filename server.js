@@ -22,6 +22,12 @@ const FALCON_BASES = [
   'http://localhost:8083', 'http://127.0.0.1:8083', 'http://host.docker.internal:8083'
 ].filter(Boolean);
 
+// Optional: standalone PQC Key Rotation microservice
+const KEYROTATION_BASES = [
+  process.env.KEYROTATION_BASE || process.env.ROTATION_BASE,
+  'http://localhost:8092', 'http://127.0.0.1:8092', 'http://host.docker.internal:8092'
+].filter(Boolean);
+
 // ---- helpers ----
 function withTimeout(promise, ms = 2500) {
   return Promise.race([
@@ -38,6 +44,17 @@ async function probe(base) {
 async function firstReachable(bases) {
   for (const b of bases) if (await probe(b)) return b;
   return null;
+}
+async function getJSON(url, timeoutMs = 4000) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    const txt = await res.text();
+    let json; try { json = txt ? JSON.parse(txt) : {}; } catch { json = { raw: txt }; }
+    if (!res.ok) throw new Error(json?.error || `${url} -> ${res.status}`);
+    return json;
+  } finally { clearTimeout(id); }
 }
 async function postJSON(url, body, timeoutMs = 4000) {
   const ctrl = new AbortController();
@@ -88,11 +105,13 @@ fastify.get('/health', async () => {
   const kb = await firstReachable(KYBER_BASES);
   const db = await firstReachable(DILITHIUM_BASES);
   const fb = await firstReachable(FALCON_BASES);
+  const rb = await firstReachable(KEYROTATION_BASES);
   return {
     status: kb && (db || fb) ? 'ok' : 'degraded',
     kyber: { reachable: !!kb, base: kb },
     dilithium: { reachable: !!db, base: db },
-    falcon: { reachable: !!fb, base: fb }
+    falcon: { reachable: !!fb, base: fb },
+    rotation: { reachable: !!rb, base: rb }
   };
 });
 
@@ -124,33 +143,62 @@ fastify.post('/select/ake', async (req, reply) => {
     let signerPublicKey = signerInfo.publicKey;
     const signerLevel = level || signerInfo.level;
 
-    // 3) Ask chosen scheme to sign Kyber pubkey
+    // 3) Prefer using the Key Rotation service to sign (if available)
+    //    Fallback to underlying signature service if rotation is unavailable.
+    const rotationBase = await firstReachable(KEYROTATION_BASES);
     const signEndpoint = scheme === 'dilithium' ? '/dilithium/sign' : '/falcon/sign';
     let signature;
     let isCompressed;
-    try {
-      // Prefer messageBase64, many services expect base64 input for signing
-      const sr = await postJSON(`${sigBase}${signEndpoint}`, {
-        messageBase64: activeKyberPublicKey,
-        level: signerLevel
-      });
-      signature = sr.signature ?? sr.signatureBase64 ?? sr.sig;
-      isCompressed = sr.isCompressed;
-    } catch (_) {
-      // Fallback to bootstrap: some services expose a bootstrap that already
-      // generates a Kyber keypair and signs its public key using the internal signer.
-      const b = await postJSON(`${sigBase}/orchestrator/bootstrap`, {});
-      signature = b.signature ?? b.signatureBase64 ?? b.sig;
-      isCompressed = b.isCompressed;
 
-      // If bootstrap returns Kyber keys, use them to keep signature and key aligned
-      if (b.kyberPublicKey && b.kyberSecretKey) {
-        activeKyberPublicKey = b.kyberPublicKey;
-        activeKyberSecretKey = b.kyberSecretKey;
+    if (rotationBase) {
+      try {
+        const rotAlg = scheme === 'dilithium' ? 'dilithium-l3' : 'falcon-l1';
+        // Ensure a current key exists; rotate if necessary
+        let current = null;
+        try {
+          current = await getJSON(`${rotationBase}/orchestrator/keys/current?alg=${encodeURIComponent(rotAlg)}`);
+        } catch (_) {
+          // No current key — rotate to create one
+          await postJSON(`${rotationBase}/keys/rotate`, { alg: rotAlg, level: signerLevel });
+          current = await getJSON(`${rotationBase}/orchestrator/keys/current?alg=${encodeURIComponent(rotAlg)}`);
+        }
+        // Sign the Kyber public key via rotator
+        const sr = await postJSON(`${rotationBase}/sign`, {
+          alg: rotAlg,
+          messageB64: activeKyberPublicKey
+        });
+        signature = sr.signatureB64 || sr.signatureBase64 || sr.signature || sr.sig;
+        if (current?.publicKey) signerPublicKey = current.publicKey;
+      } catch (_) {
+        // Rotation signing failed; fall through to direct signer
       }
-      // If bootstrap returns signer public key, prefer it
-      const maybeSigner = b.signerPublicKey || b.falconSignerPublicKey || b.dilithiumSignerPublicKey || b.publicKey;
-      if (maybeSigner) signerPublicKey = maybeSigner;
+    }
+
+    if (!signature) {
+      try {
+        // Prefer messageBase64, many services expect base64 input for signing
+        const sr = await postJSON(`${sigBase}${signEndpoint}`, {
+          messageBase64: activeKyberPublicKey,
+          level: signerLevel
+        });
+        signature = sr.signature ?? sr.signatureBase64 ?? sr.sig;
+        isCompressed = sr.isCompressed;
+      } catch (_) {
+        // Fallback to bootstrap: some services expose a bootstrap that already
+        // generates a Kyber keypair and signs its public key using the internal signer.
+        const b = await postJSON(`${sigBase}/orchestrator/bootstrap`, {});
+        signature = b.signature ?? b.signatureBase64 ?? b.sig;
+        isCompressed = b.isCompressed;
+
+        // If bootstrap returns Kyber keys, use them to keep signature and key aligned
+        if (b.kyberPublicKey && b.kyberSecretKey) {
+          activeKyberPublicKey = b.kyberPublicKey;
+          activeKyberSecretKey = b.kyberSecretKey;
+        }
+        // If bootstrap returns signer public key, prefer it
+        const maybeSigner = b.signerPublicKey || b.falconSignerPublicKey || b.dilithiumSignerPublicKey || b.publicKey;
+        if (maybeSigner) signerPublicKey = maybeSigner;
+      }
     }
 
     if (!signature) throw new Error('No signature produced');
