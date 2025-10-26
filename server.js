@@ -138,18 +138,26 @@ fastify.post('/select/ake', async (req, reply) => {
     let activeKyberPublicKey = kyberPublicKey;
     let activeKyberSecretKey = kyberSecretKey;
 
-    // 2) Get orchestrator signer (from chosen scheme service)
-    const signerInfo = await fetch(`${sigBase}/orchestrator/signer`).then(r => r.json());
-    // Prefer algorithm-specific fields when available; fall back to generic
-    let signerPublicKey = signerInfo.signerPublicKey
-      || signerInfo.falconSignerPublicKey
-      || signerInfo.dilithiumSignerPublicKey
-      || signerInfo.publicKey;
-    let signerLevel = level || signerInfo.level || signerInfo.alg || signerInfo.algorithm;
-    // Normalize algorithm string if embeded in level
-    const algFromLevel = typeof signerLevel === 'string' && /^(falcon|dilithium)-l[1-5]$/i.test(signerLevel)
-      ? signerLevel.toLowerCase()
-      : null;
+  // 2) Get orchestrator signer (from chosen scheme service)
+  const signerInfo = await fetch(`${sigBase}/orchestrator/signer`).then(r => r.json());
+  // Prefer algorithm-specific fields when available; fall back to generic
+  const baseServiceSignerPublicKey = signerInfo.signerPublicKey
+    || signerInfo.falconSignerPublicKey
+    || signerInfo.dilithiumSignerPublicKey
+    || signerInfo.publicKey;
+  // Preserve the signature service's notion of level; we'll forward this to it
+  // later when asking it to verify + encapsulate. Rotation may use a different
+  // algorithm string (e.g. "falcon-l5"), but the service typically expects its
+  // own level format (e.g. "Falcon-1024").
+  const serviceSignerLevel = level || signerInfo.level || signerInfo.alg || signerInfo.algorithm;
+
+  let signerPublicKey = baseServiceSignerPublicKey;
+  let signerLevel = serviceSignerLevel;
+
+  // Normalize algorithm string if embedded in level (used only for rotator alg)
+  const algFromLevel = typeof serviceSignerLevel === 'string' && /^(falcon|dilithium)-l[1-5]$/i.test(serviceSignerLevel)
+    ? serviceSignerLevel.toLowerCase()
+    : null;
 
     // 3) Prefer using the Key Rotation service to sign (if available)
     //    Fallback to underlying signature service if rotation is unavailable.
@@ -178,9 +186,30 @@ fastify.post('/select/ake', async (req, reply) => {
           messageB64: activeKyberPublicKey
         });
         signature = sr.signatureB64 || sr.signatureBase64 || sr.signature || sr.sig;
-        if (current?.publicKey) signerPublicKey = current.publicKey;
-        // Prefer level/alg reported by rotator for correctness; fallback to rotAlg
-        signerLevel = (current && (current.level || current.alg)) || rotAlg;
+        // Extract a usable public key from the rotator's response. Different
+        // implementations may expose different field names. If we cannot find
+        // one confidently, we will discard the rotation path and fall back to
+        // signing directly with the signature service (ensuring alignment).
+        const rotPubCandidates = [
+          current?.publicKey,
+          current?.publicKeyB64,
+          current?.publicKeyBase64,
+          current?.signerPublicKey,
+          current?.falconPublicKey,
+          current?.dilithiumPublicKey,
+          current?.pub,
+          current?.pk
+        ].filter(v => typeof v === 'string' && v.length > 16);
+
+        if (rotPubCandidates.length > 0) {
+          signerPublicKey = rotPubCandidates[0];
+        } else {
+          // Without a clear public key from the rotator, verification would
+          // fail; clear the signature so we fall back to direct signing.
+          signature = undefined;
+        }
+        // Keep the service-provided level for downstream verification; the
+        // rotator's algorithm string is not necessarily the same format.
         // Capture compression hint if rotator returns one (mainly Falcon)
         if (typeof sr.isCompressed === 'boolean') {
           isCompressed = sr.isCompressed;
