@@ -28,6 +28,33 @@ const KEYROTATION_BASES = [
   'http://localhost:8092', 'http://127.0.0.1:8092', 'http://host.docker.internal:8092'
 ].filter(Boolean);
 
+function deriveRotationAlgorithm(scheme, levelHint) {
+  const defaultAlg = scheme === 'dilithium' ? 'dilithium-l3' : 'falcon-l5';
+
+  if (typeof levelHint === 'number' && Number.isFinite(levelHint)) {
+    const lvl = Math.min(5, Math.max(1, Math.round(levelHint)));
+    return `${scheme}-l${lvl}`;
+  }
+
+  if (typeof levelHint === 'string') {
+    const normalized = levelHint.trim().toLowerCase();
+    const explicit = normalized.match(/(falcon|dilithium)[-_ ]?l?([1-5])/);
+    if (explicit) return `${explicit[1]}-l${explicit[2]}`;
+    const numeric = normalized.match(/([1-5])/);
+    if (numeric) return `${scheme}-l${numeric[1]}`;
+  }
+
+  return defaultAlg;
+}
+
+function isSignatureVerificationError(err) {
+  const msg = typeof err?.message === 'string' ? err.message.toLowerCase() : '';
+  return msg.includes('signature_verification_failed')
+    || msg.includes('signature verification failed')
+    || msg.includes('signature mismatch')
+    || msg.includes('invalid signature');
+}
+
 // ---- helpers ----
 function withTimeout(promise, ms = 2500) {
   return Promise.race([
@@ -119,10 +146,8 @@ fastify.get('/health', async () => {
 fastify.post('/select/ake', async (req, reply) => {
   try {
     const { payloadHintBytes, policyPreferredSig, level } = req.body ?? {};
-    // choose sig scheme
     const scheme = await selectSigScheme({ payloadHintBytes, policyPreferredSig });
 
-    // discover bases
     const kyberBase = await firstReachable(KYBER_BASES);
     if (!kyberBase) throw new Error('Kyber unreachable');
     const sigBase = scheme === 'dilithium'
@@ -130,156 +155,194 @@ fastify.post('/select/ake', async (req, reply) => {
       : await firstReachable(FALCON_BASES);
     if (!sigBase) throw new Error(`${scheme} unreachable`);
 
-    // 1) Generate Kyber keys
-    const { publicKey: kyberPublicKey, secretKey: kyberSecretKey } =
+    const { publicKey: initialKyberPublicKey, secretKey: initialKyberSecretKey } =
       await postJSON(`${kyberBase}/kyber/generate-keypair`, {});
 
-    // Track the active keys that pair with the signature we will use
-    let activeKyberPublicKey = kyberPublicKey;
-    let activeKyberSecretKey = kyberSecretKey;
-
-  // 2) Get orchestrator signer (from chosen scheme service)
-  const signerInfo = await fetch(`${sigBase}/orchestrator/signer`).then(r => r.json());
-  // Prefer algorithm-specific fields when available; fall back to generic
-  const baseServiceSignerPublicKey = signerInfo.signerPublicKey
-    || signerInfo.falconSignerPublicKey
-    || signerInfo.dilithiumSignerPublicKey
-    || signerInfo.publicKey;
-  // Preserve the signature service's notion of level; we'll forward this to it
-  // later when asking it to verify + encapsulate. Rotation may use a different
-  // algorithm string (e.g. "falcon-l5"), but the service typically expects its
-  // own level format (e.g. "Falcon-1024").
-  const serviceSignerLevel = level || signerInfo.level || signerInfo.alg || signerInfo.algorithm;
-
-  let signerPublicKey = baseServiceSignerPublicKey;
-  let signerLevel = serviceSignerLevel;
-
-  // Normalize algorithm string if embedded in level (used only for rotator alg)
-  const algFromLevel = typeof serviceSignerLevel === 'string' && /^(falcon|dilithium)-l[1-5]$/i.test(serviceSignerLevel)
-    ? serviceSignerLevel.toLowerCase()
-    : null;
-
-    // 3) Prefer using the Key Rotation service to sign (if available)
-    //    Fallback to underlying signature service if rotation is unavailable.
-    const rotationBase = await firstReachable(KEYROTATION_BASES);
+    const signerInfo = await fetch(`${sigBase}/orchestrator/signer`).then(r => r.json());
+    const baseServiceSignerPublicKey = signerInfo.signerPublicKey
+      || signerInfo.falconSignerPublicKey
+      || signerInfo.dilithiumSignerPublicKey
+      || signerInfo.publicKey;
+    const baseSignerLevel = level ?? signerInfo.level ?? signerInfo.alg ?? signerInfo.algorithm;
+    const baseSignerKid = signerInfo.kid || signerInfo.keyId;
     const signEndpoint = scheme === 'dilithium' ? '/dilithium/sign' : '/falcon/sign';
-    let signature;
-    let isCompressed;
+
+    const rotationBase = await firstReachable(KEYROTATION_BASES);
+    const rotationAlg = deriveRotationAlgorithm(scheme, baseSignerLevel);
+
+    const signatureStrategies = [];
 
     if (rotationBase) {
-      try {
-        // Choose rotation algorithm to MATCH the underlying signature service
-        // Prefer explicit algorithm-style level if provided by signer
-        const rotAlg = algFromLevel || (scheme === 'dilithium' ? 'dilithium-l3' : 'falcon-l5');
-        // Ensure a current key exists; rotate if necessary
-        let current = null;
+      signatureStrategies.push(async () => {
         try {
-          current = await getJSON(`${rotationBase}/orchestrator/keys/current?alg=${encodeURIComponent(rotAlg)}`);
-        } catch (_) {
-          // No current key — rotate to create one
-          await postJSON(`${rotationBase}/keys/rotate`, { alg: rotAlg, level: signerLevel });
-          current = await getJSON(`${rotationBase}/orchestrator/keys/current?alg=${encodeURIComponent(rotAlg)}`);
-        }
-        // Sign the Kyber public key via rotator
-        const sr = await postJSON(`${rotationBase}/sign`, {
-          alg: rotAlg,
-          messageB64: activeKyberPublicKey
-        });
-        signature = sr.signatureB64 || sr.signatureBase64 || sr.signature || sr.sig;
-        // Extract a usable public key from the rotator's response. Different
-        // implementations may expose different field names. If we cannot find
-        // one confidently, we will discard the rotation path and fall back to
-        // signing directly with the signature service (ensuring alignment).
-        const rotPubCandidates = [
-          current?.publicKey,
-          current?.publicKeyB64,
-          current?.publicKeyBase64,
-          current?.signerPublicKey,
-          current?.falconPublicKey,
-          current?.dilithiumPublicKey,
-          current?.pub,
-          current?.pk
-        ].filter(v => typeof v === 'string' && v.length > 16);
+          let current;
+          try {
+            current = await getJSON(`${rotationBase}/orchestrator/keys/current?alg=${encodeURIComponent(rotationAlg)}`);
+          } catch (err) {
+            await postJSON(`${rotationBase}/keys/rotate`, { alg: rotationAlg, level: baseSignerLevel });
+            current = await getJSON(`${rotationBase}/orchestrator/keys/current?alg=${encodeURIComponent(rotationAlg)}`);
+          }
 
-        if (rotPubCandidates.length > 0) {
-          signerPublicKey = rotPubCandidates[0];
-        } else {
-          // Without a clear public key from the rotator, verification would
-          // fail; clear the signature so we fall back to direct signing.
-          signature = undefined;
+          const signResp = await postJSON(`${rotationBase}/sign`, {
+            alg: rotationAlg,
+            level: baseSignerLevel,
+            messageB64: initialKyberPublicKey,
+            messageBase64: initialKyberPublicKey
+          });
+
+          const signature = signResp.signatureB64
+            || signResp.signatureBase64
+            || signResp.signature
+            || signResp.sig;
+          if (!signature) throw new Error('rotation signing produced no signature');
+
+          const rotPubCandidates = [
+            signResp.signerPublicKey,
+            signResp.publicKey,
+            current?.publicKey,
+            current?.publicKeyB64,
+            current?.publicKeyBase64,
+            current?.signerPublicKey,
+            current?.falconPublicKey,
+            current?.dilithiumPublicKey,
+            current?.pub,
+            current?.pk
+          ].filter(v => typeof v === 'string' && v.length > 16);
+
+          return {
+            source: 'rotation',
+            signature,
+            signerPublicKey: rotPubCandidates[0] || baseServiceSignerPublicKey,
+            signerLevel: baseSignerLevel,
+            signerKid: signResp.kid || signResp.keyId || current?.kid || current?.keyId || baseSignerKid,
+            kyberPublicKey: initialKyberPublicKey,
+            kyberSecretKey: initialKyberSecretKey,
+            isCompressed: typeof signResp.isCompressed === 'boolean' ? signResp.isCompressed : undefined
+          };
+        } catch (err) {
+          fastify.log.warn({ err }, 'rotation signing attempt failed');
+          throw err;
         }
-        // Keep the service-provided level for downstream verification; the
-        // rotator's algorithm string is not necessarily the same format.
-        // Capture compression hint if rotator returns one (mainly Falcon)
-        if (typeof sr.isCompressed === 'boolean') {
-          isCompressed = sr.isCompressed;
-        }
-      } catch (_) {
-        // Rotation signing failed; fall through to direct signer
-      }
+      });
     }
 
-    if (!signature) {
+    signatureStrategies.push(async () => {
       try {
-        // Be liberal in what we send: different services may expect
-        // messageBase64 or messageB64. Send both, plus a generic message field.
-        const sr = await postJSON(`${sigBase}${signEndpoint}`, {
-          messageBase64: activeKyberPublicKey,
-          messageB64: activeKyberPublicKey,
-          message: activeKyberPublicKey,
-          level: signerLevel
+        const signResp = await postJSON(`${sigBase}${signEndpoint}`, {
+          messageBase64: initialKyberPublicKey,
+          messageB64: initialKyberPublicKey,
+          message: initialKyberPublicKey,
+          level: baseSignerLevel
         });
-        signature = sr.signature ?? sr.signatureBase64 ?? sr.sig;
-        isCompressed = sr.isCompressed;
-        // If the signer rotated between the signer discovery and this sign
-        // operation, prefer any signer public key returned alongside the
-        // signature to ensure verification uses the matching key.
-        const signRespSigner = sr.signerPublicKey
-          || sr.falconSignerPublicKey
-          || sr.dilithiumSignerPublicKey
-          || sr.publicKey;
-        if (typeof signRespSigner === 'string' && signRespSigner.length > 16) {
-          signerPublicKey = signRespSigner;
-        }
-        if (sr.level) {
-          signerLevel = sr.level;
-        }
-      } catch (_) {
-        // Fallback to bootstrap: some services expose a bootstrap that already
-        // generates a Kyber keypair and signs its public key using the internal signer.
-        const b = await postJSON(`${sigBase}/orchestrator/bootstrap`, {});
-        signature = b.signature ?? b.signatureBase64 ?? b.sig;
-        isCompressed = b.isCompressed;
 
-        // If bootstrap returns Kyber keys, use them to keep signature and key aligned
-        if (b.kyberPublicKey && b.kyberSecretKey) {
-          activeKyberPublicKey = b.kyberPublicKey;
-          activeKyberSecretKey = b.kyberSecretKey;
-        }
-        // If bootstrap returns signer public key, prefer it
-        const maybeSigner = b.signerPublicKey || b.falconSignerPublicKey || b.dilithiumSignerPublicKey || b.publicKey;
-        if (maybeSigner) signerPublicKey = maybeSigner;
-        if (b.level) signerLevel = b.level;
+        const signature = signResp.signature
+          || signResp.signatureBase64
+          || signResp.sig
+          || signResp.signatureB64;
+        if (!signature) throw new Error('direct signing produced no signature');
+
+        const signerPublicKey = signResp.signerPublicKey
+          || signResp.falconSignerPublicKey
+          || signResp.dilithiumSignerPublicKey
+          || signResp.publicKey
+          || baseServiceSignerPublicKey;
+
+        return {
+          source: 'direct',
+          signature,
+          signerPublicKey,
+          signerLevel: signResp.level || baseSignerLevel,
+          signerKid: signResp.kid || signResp.keyId || baseSignerKid,
+          kyberPublicKey: initialKyberPublicKey,
+          kyberSecretKey: initialKyberSecretKey,
+          isCompressed: typeof signResp.isCompressed === 'boolean' ? signResp.isCompressed : undefined
+        };
+      } catch (err) {
+        fastify.log.warn({ err }, 'direct signing attempt failed');
+        throw err;
       }
-    }
-
-    if (!signature) throw new Error('No signature produced');
-
-    // 4) Verify signature & encapsulate with verified Kyber key
-    const encapRes = await postJSON(`${sigBase}/orchestrator/encapsulate-verified`, {
-      kyberPublicKey: activeKyberPublicKey,
-      signature,
-      signatureBase64: signature, // tolerance for services expecting this field
-      signerPublicKey,
-      falconSignerPublicKey: scheme === 'falcon' ? signerPublicKey : undefined,
-      dilithiumSignerPublicKey: scheme === 'dilithium' ? signerPublicKey : undefined,
-      level: signerLevel,
-      isCompressed
     });
 
-    // 5) Decapsulate on Kyber to confirm shared secret
+    signatureStrategies.push(async () => {
+      const bootstrap = await postJSON(`${sigBase}/orchestrator/bootstrap`, {});
+      const signature = bootstrap.signature
+        || bootstrap.signatureBase64
+        || bootstrap.sig
+        || bootstrap.signatureB64;
+      if (!signature) throw new Error('bootstrap produced no signature');
+
+      const signerPublicKey = bootstrap.signerPublicKey
+        || bootstrap.falconSignerPublicKey
+        || bootstrap.dilithiumSignerPublicKey
+        || bootstrap.publicKey
+        || baseServiceSignerPublicKey;
+
+      return {
+        source: 'bootstrap',
+        signature,
+        signerPublicKey,
+        signerLevel: bootstrap.level || baseSignerLevel,
+        signerKid: bootstrap.kid || bootstrap.keyId || baseSignerKid,
+        kyberPublicKey: bootstrap.kyberPublicKey || initialKyberPublicKey,
+        kyberSecretKey: bootstrap.kyberSecretKey || initialKyberSecretKey,
+        isCompressed: typeof bootstrap.isCompressed === 'boolean' ? bootstrap.isCompressed : undefined
+      };
+    });
+
+    let encapRes = null;
+    let ctxForDecap = null;
+    let lastSigError = null;
+
+    for (const getContext of signatureStrategies) {
+      let ctx;
+      try {
+        ctx = await getContext();
+      } catch (err) {
+        continue;
+      }
+
+      if (!ctx?.signature || !ctx.signerPublicKey || !ctx.kyberPublicKey || !ctx.kyberSecretKey) {
+        continue;
+      }
+
+      const payload = {
+        kyberPublicKey: ctx.kyberPublicKey,
+        signature: ctx.signature,
+        signatureBase64: ctx.signature,
+        signatureB64: ctx.signature,
+        signerPublicKey: ctx.signerPublicKey,
+        falconSignerPublicKey: scheme === 'falcon' ? ctx.signerPublicKey : undefined,
+        dilithiumSignerPublicKey: scheme === 'dilithium' ? ctx.signerPublicKey : undefined,
+        level: ctx.signerLevel ?? baseSignerLevel,
+        isCompressed: ctx.isCompressed
+      };
+
+      if (ctx.signerKid) {
+        payload.signerKid = ctx.signerKid;
+        payload.kid = ctx.signerKid;
+        payload.keyId = ctx.signerKid;
+      }
+
+      try {
+        encapRes = await postJSON(`${sigBase}/orchestrator/encapsulate-verified`, payload);
+        ctxForDecap = ctx;
+        break;
+      } catch (err) {
+        if (isSignatureVerificationError(err)) {
+          lastSigError = err;
+          fastify.log.warn({ err, strategy: ctx.source }, 'signature verification failed, trying next strategy');
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (!encapRes || !ctxForDecap) {
+      throw lastSigError ?? new Error('No signature strategy succeeded');
+    }
+
     const decapRes = await postJSON(`${kyberBase}/kyber/decapsulate`, {
-      secretKey: activeKyberSecretKey,
+      secretKey: ctxForDecap.kyberSecretKey,
       ciphertext: encapRes.ciphertext
     });
 
@@ -291,14 +354,15 @@ fastify.post('/select/ake', async (req, reply) => {
       reason: policyPreferredSig ? `policy:${policyPreferredSig}` :
               (payloadHintBytes && payloadHintBytes <= 1024) ? 'payload_tight' :
               'default_or_health',
-      signerLevel,
+      signerLevel: ctxForDecap.signerLevel ?? baseSignerLevel,
+      signerKid: ctxForDecap.signerKid ?? baseSignerKid,
       kyber: { ciphertextLen: encapRes.ciphertext?.length ?? 0 },
       sharedSecretMatch: same
     };
   } catch (e) {
+    fastify.log.error(e, 'select/ake failed');
     reply.code(502);
     return { error: 'select_ake_failed', detail: e?.message || String(e) };
   }
 });
-
 await fastify.listen({ port: PORT, host: HOST });
