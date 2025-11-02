@@ -228,6 +228,19 @@ fastify.post('/select/ake', async (req, reply) => {
         });
         signature = sr.signature ?? sr.signatureBase64 ?? sr.sig;
         isCompressed = sr.isCompressed;
+        // If the signer rotated between the signer discovery and this sign
+        // operation, prefer any signer public key returned alongside the
+        // signature to ensure verification uses the matching key.
+        const signRespSigner = sr.signerPublicKey
+          || sr.falconSignerPublicKey
+          || sr.dilithiumSignerPublicKey
+          || sr.publicKey;
+        if (typeof signRespSigner === 'string' && signRespSigner.length > 16) {
+          signerPublicKey = signRespSigner;
+        }
+        if (sr.level) {
+          signerLevel = sr.level;
+        }
       } catch (_) {
         // Fallback to bootstrap: some services expose a bootstrap that already
         // generates a Kyber keypair and signs its public key using the internal signer.
@@ -253,7 +266,10 @@ fastify.post('/select/ake', async (req, reply) => {
     const encapRes = await postJSON(`${sigBase}/orchestrator/encapsulate-verified`, {
       kyberPublicKey: activeKyberPublicKey,
       signature,
+      signatureBase64: signature, // tolerance for services expecting this field
       signerPublicKey,
+      falconSignerPublicKey: scheme === 'falcon' ? signerPublicKey : undefined,
+      dilithiumSignerPublicKey: scheme === 'dilithium' ? signerPublicKey : undefined,
       level: signerLevel,
       isCompressed
     });
