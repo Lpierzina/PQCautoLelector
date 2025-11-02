@@ -221,9 +221,12 @@ fastify.post('/select/ake', async (req, reply) => {
 
     if (!signature) {
       try {
-        // Prefer messageBase64, many services expect base64 input for signing
+        // Be liberal in what we send: different services may expect
+        // messageBase64 or messageB64. Send both, plus a generic message field.
         const sr = await postJSON(`${sigBase}${signEndpoint}`, {
           messageBase64: activeKyberPublicKey,
+          messageB64: activeKyberPublicKey,
+          message: activeKyberPublicKey,
           level: signerLevel
         });
         signature = sr.signature ?? sr.signatureBase64 ?? sr.sig;
